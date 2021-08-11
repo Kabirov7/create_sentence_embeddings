@@ -1,3 +1,6 @@
 db_params.py
 __pycache__
-.idea
+.idea/
+bubble_data_1.json
+createDataForNivo.py
+instagram_news_comments_with_embeddings.csv
