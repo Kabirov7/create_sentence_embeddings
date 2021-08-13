@@ -9,7 +9,7 @@ import requests
 import math
 import tensorflow_text
 from pprint import pprint
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 import pymorphy2
 
@@ -31,10 +31,10 @@ from natasha import (
 
 class LukoshkoTextToEmbeddings:
 	def __init__(self, db_params, table_name, table_name_ner, table_similar_articles):
-		# self._create_table(db_params, table_name)
-		# self._create_table_ner(db_params, table_name_ner)
+		self._create_table(db_params, table_name)
+		self._create_table_ner(db_params, table_name_ner)
 		self._create_table_similar_articles(db_params, table_similar_articles)
-		# self.embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-multilingual/3")
+		self.embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-multilingual/3")
 
 		self.segmenter = Segmenter()
 		self.morph_vocab = MorphVocab()
@@ -148,47 +148,105 @@ class LukoshkoTextToEmbeddings:
 
 		return df_PERS
 
-	def create_NERs(self, db_params, source_table_name, target_table_name):
-		conn = None
-		insert_conn = None
+	def find_similiar_articles(self, article, sentence_limit=None, distance_cutoff=0.99, overlap=2):
+		"""
+		Find similiar articles
 
-		try:
-			conn = psycopg2.connect(**db_params)
-			insert_conn = psycopg2.connect(**db_params)
-			rows = []
-			with conn.cursor('server_side_cursor', cursor_factory=psycopg2.extras.DictCursor) as cursor:
-				cursor.execute(f"SELECT * FROM {source_table_name} "
-							   f"WHERE mass_media_idx in (SELECT s.mass_media_idx "
-							   f"FROM {source_table_name} s where s.lang = 'ru' EXCEPT "
-							   f"SELECT tg.mass_media_idx "
-							   f"FROM {target_table_name} tg where tg.lang = 'ru');")
-				for i, row in enumerate(cursor):
-					columns = list(row.keys())
-					maintext = row['maintext']
-					ner = self.generate_NER(maintext)
-					for i, irow in ner.iterrows():
-						data = dict(zip(columns, row))
-						data.update({
-							"per": irow['PER'],
-							"per_normal": irow['PER_normal'],
-							"nom_name": irow["NOM_name"]
-						})
+		:param article: Article text to find
+		:param sentence_limit: Sentence limit for article
+		:param distance_cutoff: Cutoff for distance (the lower the more accurate)
+		:param overlap: Overlaps quantity
+		:return: returns pandas dataframe
+		"""
 
-						rows.append(data)
-						i += 1
-					if len(rows) % 1000 == 0:
-						self._insert_ner(insert_conn, rows, target_table_name)
-						rows = []
+		sentences = re.split(r'(?<=[^А-Я].[.? \n]) +(?=[А-Я \n])', article)
 
-				self._insert_ner(insert_conn, rows, target_table_name)
-				print("Insert NER", len(rows))
-		except (Exception, psycopg2.DatabaseError) as error:
-			print(error)
-		finally:
-			if conn:
-				conn.close()
-			if insert_conn:
-				insert_conn.close()
+		if sentence_limit:
+			sentences = sentences[:sentence_limit]
+
+		sentence_distances = self.get_distances(sentences)
+
+		list_of_data = []
+
+		for distance_data in sentence_distances:
+			list_of_indexes = []
+			for index in distance_data['metadata']:
+				list_of_indexes.append(int(index))
+
+			# get additional metadata info
+			dist_metadata = self.get_metadata(list_of_indexes)
+
+			for metadata in dist_metadata:
+				info = {
+					'distance': distance_data['metadata'][str(metadata['faiss_index'])]['distance'],
+					'mass_media_name': metadata['mass_media_name'],
+					'sentence_number': metadata['sentence_number'],
+					'title': metadata['title'],
+					'sentence': metadata['sentence'],
+					'sentence_hash': metadata['sentence_hash'],
+					'lang': metadata['lang'],
+					'scraping_time': metadata['scraping_time'],
+					'url': metadata['url'],
+					'mass_media_maintext_hash': metadata['mass_media_maintext_hash'],
+					'clean_sentence': metadata['clean_sentence'],
+					# 'serialized_array_meta': metadata['serialized_array_meta'],
+					# 'array_bytes': metadata['array_bytes'],
+					'scraper_idx': metadata['scraper_idx'],
+					'faiss_index': metadata['faiss_index']
+				}
+
+				list_of_data.append(info)
+
+		df_distances = pd.DataFrame(list_of_data)
+
+		# distance_cutoff
+		df_distances = df_distances[df_distances['distance'] <= distance_cutoff]
+
+		# overlaps
+		df_overlaps = df_distances['mass_media_maintext_hash'].value_counts().to_frame().reset_index()
+		df_overlaps.rename(columns={'index': 'article_hash', 'mass_media_maintext_hash': 'overlaps'}, inplace=True)
+
+		df_overlaps = df_overlaps[df_overlaps['overlaps'] >= overlap]
+
+		# mass media info
+		df_mass_media = df_distances[['mass_media_name', 'mass_media_maintext_hash', 'title', 'url']].drop_duplicates(
+			keep='first')
+
+		df_overlaps = pd.merge(df_overlaps, df_mass_media, how='left', left_on='article_hash',
+							   right_on='mass_media_maintext_hash')
+
+		return df_overlaps
+
+	def get_distances(self, sentences):
+		response = requests.post(
+			'https://lukoshkoapi.kloop.io/api/v1/text_range_search/',
+			json={
+				"sentences": sentences,
+				"db": "scrapers",
+				"table": "media",
+				"with_meta": "False",
+				"meta_with_embeddings": "False",
+				"top_k": 10
+			})
+
+		result = json.loads(response.content.decode())
+
+		return result
+
+	def get_metadata(self, list_of_indexes):
+		response = requests.post(
+			'https://lukoshkoapi.kloop.io/api/v1/text_search/',
+			json={
+				"text": list_of_indexes,
+				"db": "scrapers",
+				"table": "media",
+				"search_column": "faiss_index",
+				"is_array": "True"
+			})
+
+		result = json.loads(response.content.decode())
+
+		return result
 
 	def _create_table(self, db_params, table_name):
 		conn = None
@@ -203,7 +261,7 @@ class LukoshkoTextToEmbeddings:
 					f'sentence text,'
 					f'sentence_hash text,'
 					f'lang text,'
-					f'scraping_time text,'
+					f'scraping_time TIMESTAMP,'
 					f'url text,'
 					f'mass_media_maintext_hash text,'
 					f'clean_sentence text,'
@@ -226,28 +284,15 @@ class LukoshkoTextToEmbeddings:
 			with conn.cursor() as cursor:
 				cursor.execute(
 					f'CREATE TABLE IF NOT EXISTS {table_name}('
-					f'    mass_media_name TEXT,'
-					f'    title           TEXT,'
-					f'    author          TEXT,'
-					f'    date_publish    TEXT,'
 					f'    url             TEXT   NOT NULL,'
-					f'    tags            TEXT,'
-					f'    lang            TEXT,'
-					f'    maintext_hash   TEXT   NOT NULL,'
-					f'    scraping_time   TEXT,'
-					f'    mass_media_idx  BIGINT NOT NULL,'
-					f'    per             TEXT,'
-					f'    per_normal      TEXT,'
 					f'    nom_name        TEXT,'
 					f'    faiss_index     SERIAL NOT NULL,'
-					f'    CONSTRAINT mass_media_ner_pk'
-					f'        PRIMARY KEY (url, maintext_hash, per),'
-					f'    CONSTRAINT mass_media_ner_mass_media_url_maintext_hash_fk'
-					f'        foreign key (url, maintext_hash) REFERENCES mass_media);'
+					f'    CONSTRAINT {table_name}_url_nom_pk'
+					f'        PRIMARY KEY (url, nom_name));'
 				)
 				cursor.execute(
-					f'CREATE UNIQUE INDEX IF NOT EXISTS mass_media_ner_url_hash_p_pnormal_nom_uindex '
-					f'ON {table_name} (url, maintext_hash, per, per_normal, nom_name);'
+					f'CREATE UNIQUE INDEX IF NOT EXISTS {table_name}_url_nom_uindex '
+					f'ON mass_media_ner (url, nom_name);'
 				)
 				conn.commit()
 		except Exception as e:
@@ -262,30 +307,33 @@ class LukoshkoTextToEmbeddings:
 			conn = psycopg2.connect(**db_params)
 			with conn.cursor() as cursor:
 				cursor.execute(
-					f'CREATE TABLE IF NOT EXISTS {table_name}('
-					f'    origin_mass_media_name   TEXT,'
-					f'    origin_title             TEXT,'
-					f'    origin_author            TEXT,'
-					f'    origin_date_publish      TEXT,'
-					f'    origin_url               TEXT,'
-					f'    origin_tags              TEXT,'
-					f'    origin_maintext_hash     TEXT,'
-					f'    origin_scraping_time     TEXT,'
-					f'    mass_media_idx           BIGINT NOT NULL,'
-					f'    count_similar_sentences  INT,'
-					f'    mass_meida_name          TEXT,'
-					f'    mass_meida_maintext_hash TEXT,'
-					f'    title                    TEXT,'
-					f'    url                      TEXT,'
-					f'    faiss_index              SERIAL NOT NULL,'
+					f'CREATE TABLE IF NOT EXISTS {table_name}'
+					f'('
+					f'    origin_mass_media_name       TEXT,'
+					f'    origin_title                 TEXT,'
+					f'    origin_author                TEXT,'
+					f'    origin_date_publish          TEXT,'
+					f'    origin_url                   TEXT,'
+					f'    origin_tags                  TEXT,'
+					f'    origin_lang                  TEXT,'
+					f'    origin_maintext_hash         TEXT,'
+					f'    origin_scraping_time         TIMESTAMP,'
+					f'    mass_media_idx               BIGINT NOT NULL,'
+					f'    count_similar_sentences      INT,'
+					f'    sim_mass_meida_name          TEXT,'
+					f'    sim_mass_meida_maintext_hash TEXT,'
+					f'    sim_title                    TEXT,'
+					f'    sim_url                      TEXT,'
+					f'    faiss_index                  SERIAL NOT NULL,'
 					f'    CONSTRAINT {table_name}_pk PRIMARY KEY'
-					f'        (origin_url, origin_maintext_hash, mass_meida_maintext_hash, url),'
-					f'    CONSTRAINT {table_name}_url_hash_fk foreign key (url, origin_maintext_hash)'
-					f'        REFERENCES mass_media);'
+					f'        (origin_url, origin_maintext_hash, sim_mass_meida_maintext_hash, sim_url),'
+					f'    CONSTRAINT {table_name}_url_hash_fk foreign key (origin_url, origin_maintext_hash)'
+					f'        REFERENCES mass_media'
+					f');'
 				)
 				cursor.execute(
 					f'CREATE UNIQUE INDEX IF NOT EXISTS {table_name}_urls_hashes_uindex'
-					f'    ON {table_name} (origin_url, url, origin_maintext_hash, mass_meida_maintext_hash);'
+					f'    ON {table_name} (origin_url, sim_url, origin_maintext_hash, sim_mass_meida_maintext_hash);'
 				)
 				conn.commit()
 		except Exception as e:
@@ -341,19 +389,40 @@ class LukoshkoTextToEmbeddings:
 				psycopg2.extras.execute_batch(cursor,
 											  f"""
 	                                    INSERT INTO {table_name}(
-	                                         mass_media_name,
-	                                         title,
-	                                         author,
-	                                         date_publish,
 	                                         url,
-	                                         tags,
-	                                         lang,
-	                                         maintext_hash,
-	                                         scraping_time,
-	                                         mass_media_idx,
-	                                         per,
-	                                         per_normal,
 											 nom_name
+	                                     )
+										VALUES (
+											%(url)s,
+											%(nom_name)s
+										)
+										ON CONFLICT ON CONSTRAINT {table_name}_url_nom_pk DO NOTHING;""",
+											  rows, page_size=1000)
+			conn.commit()
+		except Exception as e:
+			print(e)
+
+	def _insert_similar_article(self, conn, rows, table_name):
+		try:
+			with conn.cursor() as cursor:
+				psycopg2.extras.execute_batch(cursor,
+											  f"""
+	                                    INSERT INTO {table_name}(
+	                                         origin_mass_media_name,
+	                                         origin_title,
+	                                         origin_author,
+	                                         origin_date_publish,
+	                                         origin_url,
+	                                         origin_tags,
+	                                         origin_lang,
+	                                         origin_maintext_hash,
+	                                         origin_scraping_time,
+	                                         mass_media_idx,
+	                                         count_similar_sentences,
+	                                         sim_mass_meida_name,
+	                                         sim_mass_meida_maintext_hash,
+	                                         sim_title,
+	                                         sim_url
 	                                     )
 										VALUES (
 											%(mass_media_name)s,
@@ -366,11 +435,13 @@ class LukoshkoTextToEmbeddings:
 											%(maintext_hash)s,
 											%(scraping_time)s,
 											%(mass_media_idx)s,
-											%(per)s,
-											%(per_normal)s,
-											%(nom_name)s
+											%(count_similar_sentences)s,
+											%(sim_mass_media_name)s,
+											%(sim_mass_media_maintext_hash)s,
+											%(sim_title)s,
+											%(sim_url)s
 										)
-										ON CONFLICT ON CONSTRAINT mass_media_ner_pk DO NOTHING;""",
+										ON CONFLICT ON CONSTRAINT {table_name}_pk DO NOTHING;""",
 											  rows, page_size=1000)
 			conn.commit()
 		except Exception as e:
@@ -421,6 +492,111 @@ class LukoshkoTextToEmbeddings:
 			if insert_conn:
 				insert_conn.close()
 
+	def create_NERs(self, db_params, source_table_name, target_table_name):
+		conn = None
+		insert_conn = None
+
+		try:
+			conn = psycopg2.connect(**db_params)
+			insert_conn = psycopg2.connect(**db_params)
+			rows = []
+			with conn.cursor('server_side_cursor', cursor_factory=psycopg2.extras.DictCursor) as cursor:
+				today = datetime.now().strftime("%Y-%m-%d")
+				cursor.execute(f"""
+								SELECT *
+								FROM {source_table_name}
+								WHERE url in (SELECT s.url
+											  FROM {source_table_name} s
+											  where s.lang = 'ru'
+												and mass_media_name != 'mk' EXCEPT
+											  SELECT tg.url
+											  FROM {target_table_name} tg)
+								  and scraping_time
+									between TO_TIMESTAMP('2021-07-01', 'YYYY-MM-DD') and TO_TIMESTAMP({today}, 'YYYY-MM-DD')
+								  and mass_media_name != 'mk';
+				""")
+				for i, row in enumerate(cursor):
+					maintext = row['maintext']
+					now = datetime.now() - timedelta(hours=1)
+					scraping_time = datetime.strptime(row['scraping_time'], '%Y-%m-%d %H:%M:%S.%f')
+					if scraping_time <= now:
+						ner = self.generate_NER(maintext)
+						for i, irow in ner.iterrows():
+							data = {
+								'url': row['url'],
+								'nom_name': irow["NOM_name"]
+							}
+
+							rows.append(data)
+
+					if len(rows) % 1000 == 0:
+						self._insert_ner(insert_conn, rows, target_table_name)
+						rows = []
+
+				self._insert_ner(insert_conn, rows, target_table_name)
+				print("Insert NER", len(rows))
+		except (Exception, psycopg2.DatabaseError) as error:
+			print(error)
+		finally:
+			if conn:
+				conn.close()
+			if insert_conn:
+				insert_conn.close()
+
+	def create_similar_articles(self, db_params, source_table_name, target_table_name):
+		conn = None
+		insert_conn = None
+
+		try:
+			conn = psycopg2.connect(**db_params)
+			insert_conn = psycopg2.connect(**db_params)
+			rows = []
+			with conn.cursor('server_side_cursor', cursor_factory=psycopg2.extras.DictCursor) as cursor:
+				cursor.execute(f"""
+								SELECT *
+								FROM {source_table_name}
+								WHERE mass_media_idx in (SELECT s.mass_media_idx
+														 FROM {source_table_name} s
+														 where s.lang = 'ru'
+														   and mass_media_name != 'mk' EXCEPT
+														 SELECT tg.mass_media_idx
+														 FROM {target_table_name} tg
+														 where tg.origin_lang = 'ru')
+								  and scraping_time
+									between TO_TIMESTAMP('2021-08-01', 'YYYY-MM-DD') and TO_TIMESTAMP('2021-08-11', 'YYYY-MM-DD')
+								  and mass_media_name != 'mk';
+				""")
+				for i, row in enumerate(cursor):
+					columns = list(row.keys())
+					maintext = row['maintext']
+					df_similar_articles = self.find_similiar_articles(maintext)
+					print(f"article#{i}")
+
+					for j, irow in df_similar_articles.iterrows():
+						data = dict(zip(columns, row))
+						data.update({
+							'count_similar_sentences': int(irow['overlaps']),
+							'sim_mass_media_name': irow['mass_media_name'],
+							'sim_mass_media_maintext_hash': irow['mass_media_maintext_hash'],
+							'sim_title': irow['title'],
+							'sim_url': irow['url']
+						})
+						rows.append(data)
+
+						if len(rows) % 1000 == 0:
+							self._insert_similar_article(insert_conn, rows, target_table_name)
+							rows = []
+
+				self._insert_similar_article(insert_conn, rows, target_table_name)
+				print("Insert similar articles")
+		except (Exception, psycopg2.DatabaseError) as error:
+			print(error)
+		finally:
+			if conn:
+				conn.close()
+			if insert_conn:
+				insert_conn.close()
+
 	def _get_sentences(self, comment):
 		comment = re.sub(r'[.?!]', '\g<0> ', comment).replace('\n', '.')
 		sentences = re.split(r'(?<=[^А-Я].[.?!])[ \s]*(?=[А-Яа-я])', comment)
@@ -439,16 +615,39 @@ class LukoshkoTextToEmbeddings:
 		else:
 			return None, None
 
+	def trigger_mass_media_text_create_index(self, token):
+		data = {
+			"table_name": "mass_media_sentence_with_embeddings",
+			"source_db_name": "scrapers",
+			"alias": "media",
+			"unique_columns": ["url", "sentence_hash"],
+			"column_to_embed": "sentence",
+			"add_directly": "True"
+		}
+		response = requests.post(
+			"https://lukoshkoapi.kloop.io/api/v1/text_create_index/",
+			data=data,
+			headers={
+				"Authorization": f"Token {token}"
+			})
+		print(response.content)
 
 if __name__ == "__main__":
 	start = datetime.now()
 	print(f'start: {start}')
 	lukoshko_text = LukoshkoTextToEmbeddings(db_params.db_params,
-											 db_params.table_name_posts, 'mass_media_ner',
+											 db_params.table_name_posts,
+											 'mass_media_ner',
 											 'mass_media_similar_articles')
-	# lukoshko_text.create_embeddings(db_params.db_params,
-	# 								'mass_media_sentence',
-	# 								db_params.table_name_posts)
-	lukoshko_text.create_NERs(db_params.db_params, 'mass_media', 'mass_media_ner')
+	lukoshko_text.create_embeddings(db_params.db_params,
+									'mass_media_sentence',
+									db_params.table_name_posts)
+	lukoshko_text.create_NERs(db_params.db_params,
+							  'mass_media',
+							  'mass_media_ner')
+	lukoshko_text.trigger_mass_media_text_create_index(db_params.token)
+	# lukoshko_text.create_similar_articles(db_params.db_params,
+	# 									  'mass_media',
+	# 									  'mass_media_similar_articles')
 	end = datetime.now()
 	print(f'end: {end}\nexecution time: {end - start}')
