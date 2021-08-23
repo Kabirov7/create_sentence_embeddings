@@ -34,7 +34,7 @@ class LukoshkoTextToEmbeddings:
 		self._create_table(db_params, table_name)
 		self._create_table_ner(db_params, table_name_ner)
 		self._create_table_similar_articles(db_params, table_similar_articles)
-		self.embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-multilingual/3")
+		# self.embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-multilingual/3")
 
 		self.segmenter = Segmenter()
 		self.morph_vocab = MorphVocab()
@@ -512,22 +512,19 @@ class LukoshkoTextToEmbeddings:
 											  SELECT tg.url
 											  FROM {target_table_name} tg)
 								  and scraping_time
-									between TO_TIMESTAMP('2021-07-01', 'YYYY-MM-DD') and TO_TIMESTAMP({today}, 'YYYY-MM-DD')
+									between to_timestamp('2021-07-01', 'YYYY-MM-DD') and to_timestamp('{today}', 'YYYY-MM-DD')
 								  and mass_media_name != 'mk';
 				""")
 				for i, row in enumerate(cursor):
 					maintext = row['maintext']
-					now = datetime.now() - timedelta(hours=1)
-					scraping_time = datetime.strptime(row['scraping_time'], '%Y-%m-%d %H:%M:%S.%f')
-					if scraping_time <= now:
-						ner = self.generate_NER(maintext)
-						for i, irow in ner.iterrows():
-							data = {
-								'url': row['url'],
-								'nom_name': irow["NOM_name"]
-							}
+					ner = self.generate_NER(maintext)
+					for i, irow in ner.iterrows():
+						data = {
+							'url': row['url'],
+							'nom_name': irow["NOM_name"]
+						}
 
-							rows.append(data)
+						rows.append(data)
 
 					if len(rows) % 1000 == 0:
 						self._insert_ner(insert_conn, rows, target_table_name)
@@ -639,13 +636,13 @@ if __name__ == "__main__":
 											 db_params.table_name_posts,
 											 'mass_media_ner',
 											 'mass_media_similar_articles')
-	lukoshko_text.create_embeddings(db_params.db_params,
-									'mass_media_sentence',
-									db_params.table_name_posts)
+	# lukoshko_text.create_embeddings(db_params.db_params,
+	# 								'mass_media_sentence',
+	# 								db_params.table_name_posts)
 	lukoshko_text.create_NERs(db_params.db_params,
 							  'mass_media',
 							  'mass_media_ner')
-	lukoshko_text.trigger_mass_media_text_create_index(db_params.token)
+	# lukoshko_text.trigger_mass_media_text_create_index(db_params.token)
 	# lukoshko_text.create_similar_articles(db_params.db_params,
 	# 									  'mass_media',
 	# 									  'mass_media_similar_articles')

@@ -7,11 +7,25 @@
       <jdbc-driver>org.postgresql.Driver</jdbc-driver>
       <jdbc-url>jdbc:postgresql://localhost:5432/mass_media</jdbc-url>
     </data-source>
-    <data-source source="LOCAL" name="postgres@localhost" uuid="2b16c360-a73e-4fa9-afbf-6c29dd51d2f9">
+    <data-source source="LOCAL" name="SCRAPY DO" uuid="2b16c360-a73e-4fa9-afbf-6c29dd51d2f9">
       <driver-ref>postgresql</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.postgresql.Driver</jdbc-driver>
       <jdbc-url>jdbc:postgresql://localhost:5432/postgres</jdbc-url>
+    </data-source>
+    <data-source source="LOCAL" name="azure" uuid="e6f7b53c-5db6-4d5b-90a0-80d3805374a3">
+      <driver-ref>postgresql</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>org.postgresql.Driver</jdbc-driver>
+      <jdbc-url>jdbc:postgresql://postgresgoszakup.postgres.database.azure.com:5432/goszakup_dev</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
+    </data-source>
+    <data-source source="LOCAL" name="one_time_use" uuid="b94e16ba-6ad7-406c-b325-b274fb73cebc">
+      <driver-ref>postgresql</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>org.postgresql.Driver</jdbc-driver>
+      <jdbc-url>jdbc:postgresql://localhost:5432/one_time_use</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
     </data-source>
   </component>
 </project>
